@@ -731,6 +731,21 @@ const ResourceNode *PipelineState::findPushConstantResourceNode() const {
 }
 
 // =====================================================================================================================
+// Returns the resource node for the push constant.
+const ResourceNode *PipelineState::findPushConstantResourceNode(unsigned set, unsigned binding) const {
+  for (const ResourceNode &node : getUserDataNodes()) {
+    if (node.type != ResourceNodeType::PushConst) {
+      continue;
+    }
+
+    if (node.set == set && node.binding == binding) {
+      return &node;
+    }
+  }
+  return nullptr;
+}
+
+// =====================================================================================================================
 // Returns true when type nodeType is compatible with candidateType.
 // A node type is compatible with a candidate type iff (nodeType) <= (candidateType) in the ResourceNodeType lattice:
 //
@@ -760,6 +775,10 @@ static bool isNodeTypeCompatible(ResourceNodeType nodeType, ResourceNodeType can
        nodeType == ResourceNodeType::DescriptorSampler) &&
       candidateType == ResourceNodeType::DescriptorCombinedTexture)
     return true;
+
+  if (nodeType == ResourceNodeType::DescriptorBuffer && candidateType == ResourceNodeType::DescriptorResource) {
+    return true;
+  }
 
   return false;
 }

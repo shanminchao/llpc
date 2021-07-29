@@ -52,7 +52,8 @@ using namespace llvm;
 // @param pointeeTy : Type that the returned pointer should point to.
 // @param instName : Name to give instruction(s)
 Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Value *descIndex, unsigned flags,
-                                         Type *const pointeeTy, const Twine &instName) {
+                                         Type *const pointeeTy, const Twine &instName,
+                                         llvm::CallInst *call) {
   Value *desc = nullptr;
   descIndex = scalarizeIfUniform(descIndex, flags & BufferFlagNonUniform);
 
@@ -68,7 +69,12 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
   const ResourceNode *node = nullptr;
   if (!m_pipelineState->isUnlinked() || !m_pipelineState->getUserDataNodes().empty()) {
     // We have the user data layout. Find the node.
-    std::tie(topNode, node) = m_pipelineState->findResourceNode(ResourceNodeType::DescriptorBuffer, descSet, binding);
+    std::tie(topNode, node) = m_pipelineState->findResourceNode(ResourceNodeType::Unknown, descSet, binding);
+    if (!node) {
+      // We did not find the resource node. Return an undef value.
+      node = m_pipelineState->findPushConstantResourceNode(descSet, binding);
+      topNode = node;
+    }
     if (!node) {
       // We did not find the resource node. Return an undef value.
       return UndefValue::get(getBufferDescTy(pointeeTy));
@@ -78,17 +84,29 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
       // Handle a descriptor in the root table (a "dynamic descriptor") specially, as long as it is not variably
       // indexed. This lgc.root.descriptor call is by default lowered in PatchEntryPointMutate into a load from the
       // spill table, but it might be able to "unspill" it to directly use shader entry SGPRs.
-      Type *descTy = getDescTy(node->type);
-      std::string callName = lgcName::RootDescriptor;
-      addTypeMangling(descTy, {}, callName);
-      unsigned dwordSize = descTy->getPrimitiveSizeInBits() / 32;
-      unsigned dwordOffset = cast<ConstantInt>(descIndex)->getZExtValue() * dwordSize;
-      if (dwordOffset + dwordSize > node->sizeInDwords) {
-        // Index out of range
+      if (node->type == ResourceNodeType::PushConst) {
+        Type *const pushConstantsType = ArrayType::get(getInt8Ty(), 4 * node->sizeInDwords);
+        Value *pushConstPtr = CreateLoadPushConstantsPtr(pushConstantsType, descSet, binding, "pushConst");
+        ChangeAddrSpaceOfUses(pushConstPtr, ADDR_SPACE_CONST, call);
+
+        Type *descTy = getDescTy(ResourceNodeType::DescriptorBuffer);
         desc = UndefValue::get(descTy);
       } else {
-        dwordOffset += node->offsetInDwords;
-        desc = CreateNamedCall(callName, descTy, getInt32(dwordOffset), Attribute::ReadNone);
+        ResourceNodeType resType = node && node->type == ResourceNodeType::DescriptorBufferCompact
+                                       ? ResourceNodeType::DescriptorBufferCompact
+                                       : ResourceNodeType::DescriptorBuffer;
+        Type *descTy = getDescTy(resType);
+        std::string callName = lgcName::RootDescriptor;
+        addTypeMangling(descTy, {}, callName);
+        unsigned dwordSize = descTy->getPrimitiveSizeInBits() / 32;
+        unsigned dwordOffset = cast<ConstantInt>(descIndex)->getZExtValue() * dwordSize;
+        if (dwordOffset + dwordSize > node->sizeInDwords) {
+          // Index out of range
+          desc = UndefValue::get(descTy);
+        } else {
+          dwordOffset += node->offsetInDwords;
+          desc = CreateNamedCall(callName, descTy, getInt32(dwordOffset), Attribute::ReadNone);
+        }
       }
     } else if (node->type == ResourceNodeType::InlineBuffer) {
       // Handle an inline buffer specially. Get a pointer to it, then expand to a descriptor.
@@ -100,7 +118,9 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
   if (!desc) {
     // Not handled by either of the special cases above...
     // Get a pointer to the descriptor, as a pointer to i8.
-    ResourceNodeType resType = node ? node->type : ResourceNodeType::DescriptorBuffer;
+    ResourceNodeType resType = node && node->type == ResourceNodeType::DescriptorBufferCompact
+                                   ? ResourceNodeType::DescriptorBufferCompact
+                                   : ResourceNodeType::DescriptorBuffer;
     Value *descPtr = getDescPtr(resType, descSet, binding, topNode, node);
     // Index it.
     if (descIndex != getInt32(0)) {
@@ -225,6 +245,26 @@ Value *DescBuilder::CreateLoadPushConstantsPtr(Type *pushConstantsTy, const Twin
   std::string callName = lgcName::PushConst;
   addTypeMangling(returnTy, {}, callName);
   return CreateNamedCall(callName, returnTy, {}, Attribute::ReadOnly, instName);
+}
+
+// =====================================================================================================================
+// Create a load of the push constants table pointer with the given set and binding.
+// This returns a pointer to the ResourceNodeType::PushConst resource in the top-level user data table.
+// The type passed must have the correct size for the push constants.
+//
+// @param pushConstantsTy : Type of the push constants table that the returned pointer will point to
+// @param set : The descriptor set in which the desired push constant table exists.
+// @param binding : The binding in the descriptor set at which the desired push constant table is bound.
+// @param instName : Name to give instruction(s)
+Value *DescBuilder::CreateLoadPushConstantsPtr(Type *pushConstantsTy, uint32_t set, uint32_t binding,
+                                               const Twine &instName) {
+  // Get the push const pointer. If subsequent code only uses this with constant GEPs and loads,
+  // then PatchEntryPointMutate might be able to "unspill" it so the code uses shader entry SGPRs
+  // directly instead of loading from the spill table.
+  Type *returnTy = pushConstantsTy->getPointerTo(ADDR_SPACE_CONST);
+  std::string callName = lgcName::PushConst;
+  addTypeMangling(returnTy, {}, callName);
+  return CreateNamedCall(callName, returnTy, {getInt32(set), getInt32(binding)}, Attribute::ReadOnly, instName);
 }
 
 // =====================================================================================================================
@@ -494,4 +534,25 @@ Value *DescBuilder::buildBufferCompactDesc(Value *desc) {
   bufDesc = CreateInsertElement(bufDesc, getInt32(sqBufRsrcWord3.u32All), 3);
 
   return bufDesc;
+}
+
+void DescBuilder::ChangeAddrSpaceOfUses(llvm::Value *new_value, AddrSpace addr_space, llvm::Value *old_value) {
+  for (auto *user : old_value->users()) {
+    Instruction *user_inst = dyn_cast<Instruction>(user);
+    if (user_inst == nullptr)
+      continue;
+
+    Instruction *new_inst = user_inst->clone();
+    new_inst->replaceUsesOfWith(old_value, new_value);
+    new_inst->insertBefore(user_inst);
+
+    PointerType *result_type = dyn_cast<PointerType>(new_inst->getType());
+    if (result_type == nullptr) {
+      user_inst->replaceAllUsesWith(new_inst);
+      continue;
+    }
+    Type *new_type = result_type->getPointerElementType()->getPointerTo(addr_space);
+    new_inst->mutateType(new_type);
+    ChangeAddrSpaceOfUses(new_inst, addr_space, user_inst);
+  }
 }

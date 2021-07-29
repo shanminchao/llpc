@@ -268,7 +268,8 @@ public:
 
   // Create a load of a buffer descriptor.
   llvm::Value *CreateLoadBufferDesc(unsigned descSet, unsigned binding, llvm::Value *descIndex, unsigned flags,
-                                    llvm::Type *pointeeTy, const llvm::Twine &instName) override final;
+                                    llvm::Type *pointeeTy, const llvm::Twine &instName,
+                                    llvm::CallInst *) override final;
 
   // Create a get of the stride (in bytes) of a descriptor.
   llvm::Value *CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
@@ -280,6 +281,10 @@ public:
 
   // Create a load of the push constants pointer.
   llvm::Value *CreateLoadPushConstantsPtr(llvm::Type *pushConstantsTy, const llvm::Twine &instName) override final;
+
+  // Create a load of the push constants pointer at the given set and binding.
+  llvm::Value *CreateLoadPushConstantsPtr(llvm::Type *pushConstantsTy, uint32_t set, uint32_t binding,
+                                          const llvm::Twine &instName);
 
   // Create a buffer length query based on the specified descriptor.
   llvm::Value *CreateGetBufferDescLength(llvm::Value *const bufferDesc, llvm::Value *offset,
@@ -311,6 +316,8 @@ private:
 
   // Build buffer compact descriptor
   llvm::Value *buildBufferCompactDesc(llvm::Value *desc);
+
+  void ChangeAddrSpaceOfUses(llvm::Value *new_value, AddrSpace addr_space, llvm::Value *old_value);
 };
 
 // =====================================================================================================================

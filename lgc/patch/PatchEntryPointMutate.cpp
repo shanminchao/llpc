@@ -150,8 +150,10 @@ private:
     // True means that we did not succeed in putting all loads into pushConstOffsets, so lgc.push.const
     // calls must be kept.
     bool pushConstSpill = false;
-    // Per-push-const-offset lists of loads from push const. We attempt to unspill these.
-    SmallVector<UserDataNodeUsage, 8> pushConstOffsets;
+    // A 2D array of per-push-const-offset lists of loads from push const. We attempt to unspill these.
+    // The first index is the dword offset of the push constant table to use.  The second index is the dword offset
+    // in that push contant table.
+    SmallVector<SmallVector<UserDataNodeUsage, 8>, 8> pushConstOffsets;
     // Per-user-data-offset lists of lgc.root.descriptor calls
     SmallVector<UserDataNodeUsage, 8> rootDescriptors;
     // Per-table lists of lgc.descriptor.table.addr calls
@@ -352,15 +354,29 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
         assert(stage != ShaderStageCopyShader);
         auto userDataUsage = getUserDataUsage(stage);
         userDataUsage->pushConst.users.push_back(call);
-        SmallVector<std::pair<Instruction *, unsigned>, 4> users;
-        users.push_back({call, 0});
+        struct UseData {
+          Instruction *use;
+          unsigned rootOffset;
+          unsigned tableOffset;
+        };
+        SmallVector<UseData, 4> users;
+        const ResourceNode *node = nullptr;
+        if (call->getNumOperands() >= 2) {
+          unsigned set = cast<ConstantInt>(call->getArgOperand(0))->getZExtValue();
+          unsigned binding = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+          node = m_pipelineState->findPushConstantResourceNode(set, binding);
+        } else {
+          node = m_pipelineState->findPushConstantResourceNode();
+        }
+        unsigned rootTableOffset = (node ? node->offsetInDwords : 0);
+        users.push_back({call, rootTableOffset, 0});
         for (unsigned i = 0; i != users.size(); ++i) {
-          Instruction *inst = users[i].first;
+          Instruction *inst = users[i].use;
           for (User *user : inst->users()) {
-            unsigned dwordOffset = users[i].second;
+            unsigned dwordOffset = users[i].tableOffset;
             if (auto bitcast = dyn_cast<BitCastInst>(user)) {
               // See through a bitcast.
-              users.push_back({bitcast, dwordOffset});
+              users.push_back({bitcast, users[i].rootOffset, dwordOffset});
               continue;
             }
             if (isa<LoadInst>(user) && !user->getType()->isAggregateType()) {
@@ -368,10 +384,12 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
               if (byteSize % 4 == 0) {
                 // This is a scalar or vector load with dword-aligned size. We can attempt to unspill it, but, for
                 // a particular dword offset, we only attempt to unspill ones with the same (minimum) size.
+                if (users[i].rootOffset >= userDataUsage->pushConstOffsets.size())
+                  userDataUsage->pushConstOffsets.resize(users[i].rootOffset + 1);
                 unsigned dwordSize = byteSize / 4;
-                userDataUsage->pushConstOffsets.resize(
-                    std::max(unsigned(userDataUsage->pushConstOffsets.size()), dwordOffset + 1));
-                auto &pushConstOffset = userDataUsage->pushConstOffsets[dwordOffset];
+                userDataUsage->pushConstOffsets[users[i].rootOffset].resize(
+                    std::max(unsigned(userDataUsage->pushConstOffsets[users[i].rootOffset].size()), dwordOffset + 1));
+                auto &pushConstOffset = userDataUsage->pushConstOffsets[users[i].rootOffset][dwordOffset];
                 if (pushConstOffset.dwordSize == 0 || pushConstOffset.dwordSize >= dwordSize) {
                   if (pushConstOffset.dwordSize != 0 && pushConstOffset.dwordSize != dwordSize) {
                     // This load type is smaller than previously seen ones at this offset. Forget the earlier
@@ -381,7 +399,7 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
                   }
                   // Remember this load for possible unspilling.
                   pushConstOffset.dwordSize = dwordSize;
-                  userDataUsage->pushConstOffsets[dwordOffset].users.push_back(cast<Instruction>(user));
+                  pushConstOffset.users.push_back(cast<Instruction>(user));
                   continue;
                 }
               }
@@ -393,7 +411,7 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
                 if (gepByteOffset % 4 == 0) {
                   // We still have a constant offset that is 4-aligned. Push it so we look at its users.
                   dwordOffset += gepByteOffset / 4;
-                  users.push_back({gep, dwordOffset});
+                  users.push_back({gep, users[i].rootOffset, dwordOffset});
                   continue;
                 }
               }
@@ -509,33 +527,36 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     }
 
     // Handle unspilled parts of the push constant.
-    for (unsigned dwordOffset = 0; dwordOffset != userDataUsage->pushConstOffsets.size(); ++dwordOffset) {
-      UserDataNodeUsage &pushConstOffset = userDataUsage->pushConstOffsets[dwordOffset];
-      if (!pushConstOffset.users.empty()) {
-        if (pushConstOffset.entryArgIdx) {
-          // This offset into the push constant is unspilled. Replace the loads with the entry arg, with a
-          // bitcast. (We know that all loads are non-aggregates of the same size, so we can bitcast.)
-          Argument *arg = func.getArg(pushConstOffset.entryArgIdx);
-          for (Instruction *&load : pushConstOffset.users) {
-            if (load && load->getFunction() == &func) {
-              builder.SetInsertPoint(load);
-              Value *replacement = nullptr;
-              if (!isa<PointerType>(load->getType()))
-                replacement = builder.CreateBitCast(arg, load->getType());
-              else {
-                // For a pointer, we need to bitcast to a single int first, then to the pointer.
-                replacement = builder.CreateBitCast(arg, builder.getIntNTy(arg->getType()->getPrimitiveSizeInBits()));
-                replacement = builder.CreateIntToPtr(replacement, load->getType());
+    for (unsigned rootOffset = 0; rootOffset != userDataUsage->pushConstOffsets.size(); ++rootOffset) {
+      for (unsigned dwordOffset = 0; dwordOffset != userDataUsage->pushConstOffsets[rootOffset].size(); ++dwordOffset) {
+        UserDataNodeUsage &pushConstOffset = userDataUsage->pushConstOffsets[rootOffset][dwordOffset];
+        if (!pushConstOffset.users.empty()) {
+          if (pushConstOffset.entryArgIdx) {
+            // This offset into the push constant is unspilled. Replace the loads with the entry arg, with a
+            // bitcast. (We know that all loads are non-aggregates of the same size, so we can bitcast.)
+            Argument *arg = func.getArg(pushConstOffset.entryArgIdx);
+            arg->setName("pushConst_" + Twine(rootOffset + dwordOffset));
+            for (Instruction *&load : pushConstOffset.users) {
+              if (load && load->getFunction() == &func) {
+                builder.SetInsertPoint(load);
+                Value *replacement = nullptr;
+                if (!isa<PointerType>(load->getType()))
+                  replacement = builder.CreateBitCast(arg, load->getType());
+                else {
+                  // For a pointer, we need to bitcast to a single int first, then to the pointer.
+                  replacement = builder.CreateBitCast(arg, builder.getIntNTy(arg->getType()->getPrimitiveSizeInBits()));
+                  replacement = builder.CreateIntToPtr(replacement, load->getType());
+                }
+                load->replaceAllUsesWith(replacement);
+                load->eraseFromParent();
+                load = nullptr;
               }
-              load->replaceAllUsesWith(replacement);
-              load->eraseFromParent();
-              load = nullptr;
             }
+          } else {
+            // This offset into the push constant is spilled. All we need to do is ensure that the push constant
+            // pointer (derived as an offset into the spill table) remains.
+            userDataUsage->pushConstSpill = true;
           }
-        } else {
-          // This offset into the push constant is spilled. All we need to do is ensure that the push constant
-          // pointer (derived as an offset into the spill table) remains.
-          userDataUsage->pushConstSpill = true;
         }
       }
     }
@@ -544,27 +565,53 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     if (!userDataUsage->pushConst.users.empty() || isComputeWithCalls()) {
       // If all uses of the push constant pointer are unspilled, we can just replace the lgc.push.const call
       // with undef, as the address is ultimately not used anywhere.
-      Value *replacementVal = nullptr;
+      SmallVector<Value *, 8> replacementVal;
       if (userDataUsage->pushConstSpill) {
-        // At least one use of the push constant pointer remains.
-        const ResourceNode *node = m_pipelineState->findSingleRootResourceNode(ResourceNodeType::PushConst);
-        Value *byteOffset = nullptr;
-        builder.SetInsertPoint(spillTable->getNextNode());
-        if (node) {
-          byteOffset = builder.getInt32(node->offsetInDwords * 4);
-          // Ensure we mark spill table usage.
-          m_pipelineState->getPalMetadata()->setUserDataSpillUsage(node->offsetInDwords);
-        } else if (!m_pipelineState->isUnlinked()) {
-          byteOffset = UndefValue::get(builder.getInt32Ty());
-        } else {
-          // Unlinked shader compilation: Use a reloc.
-          byteOffset = builder.CreateRelocationConstant(reloc::Pushconst);
+        for (Instruction *&use : userDataUsage->pushConst.users) {
+          CallInst *call = cast<CallInst>(use);
+          if (call && call->getFunction() == &func) {
+            const ResourceNode *node = nullptr;
+            if (call->getNumOperands() >= 2) {
+              unsigned set = cast<ConstantInt>(call->getArgOperand(0))->getZExtValue();
+              unsigned binding = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+              node = m_pipelineState->findPushConstantResourceNode(set, binding);
+            } else {
+              node = m_pipelineState->findSingleRootResourceNode(ResourceNodeType::PushConst);
+            }
+            Value *byteOffset = nullptr;
+            builder.SetInsertPoint(spillTable->getNextNode());
+            if (node) {
+              byteOffset = builder.getInt32(node->offsetInDwords * 4);
+              // Ensure we mark spill table usage.
+              m_pipelineState->getPalMetadata()->setUserDataSpillUsage(node->offsetInDwords);
+            } else if (!m_pipelineState->isUnlinked()) {
+              byteOffset = UndefValue::get(builder.getInt32Ty());
+            } else {
+              // Unlinked shader compilation: Use a reloc.
+              byteOffset = builder.CreateRelocationConstant(reloc::Pushconst);
+            }
+            unsigned rootOffset = (node ? node->offsetInDwords : 0);
+            if (rootOffset >= replacementVal.size()) {
+              replacementVal.resize(rootOffset + 1, nullptr);
+            }
+            replacementVal[rootOffset] = builder.CreateGEP(builder.getInt8Ty(), spillTable, byteOffset);
+          }
         }
-        replacementVal = builder.CreateGEP(builder.getInt8Ty(), spillTable, byteOffset);
       }
-      for (Instruction *&call : userDataUsage->pushConst.users) {
+
+      for (Instruction *&use : userDataUsage->pushConst.users) {
+        CallInst *call = cast<CallInst>(use);
         if (call && call->getFunction() == &func) {
-          Value *thisReplacementVal = replacementVal;
+          const ResourceNode *node = nullptr;
+          if (call->getNumOperands() >= 2) {
+            unsigned set = cast<ConstantInt>(call->getArgOperand(0))->getZExtValue();
+            unsigned binding = cast<ConstantInt>(call->getArgOperand(1))->getZExtValue();
+            node = m_pipelineState->findPushConstantResourceNode(set, binding);
+          } else {
+            node = m_pipelineState->findSingleRootResourceNode(ResourceNodeType::PushConst);
+          }
+          unsigned rootOffset = (node ? node->offsetInDwords : 0);
+          Value *thisReplacementVal = (rootOffset < replacementVal.size() ? replacementVal[rootOffset] : nullptr);
           if (!thisReplacementVal) {
             // No use of the push constant pointer remains. Just replace with undef.
             thisReplacementVal = UndefValue::get(call->getType());
@@ -574,7 +621,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
           }
           call->replaceAllUsesWith(thisReplacementVal);
           call->eraseFromParent();
-          call = nullptr;
+          use = nullptr;
         }
       }
     }
@@ -1209,33 +1256,35 @@ void PatchEntryPointMutate::addUserDataArgs(SmallVectorImpl<UserDataArg> &userDa
     // We already know that loads we have on our pushConstOffsets lists are at dword-aligned offset and dword-aligned
     // size. We need to ensure that all loads are the same size, by removing ones that are bigger than the
     // minimum size.
-    for (unsigned dwordOffset = 0, dwordEndOffset = userDataUsage->pushConstOffsets.size();
-         dwordOffset != dwordEndOffset; ++dwordOffset) {
-      UserDataNodeUsage &pushConstOffset = userDataUsage->pushConstOffsets[dwordOffset];
-      if (pushConstOffset.users.empty())
-        continue;
+    for (unsigned rootOffset = 0, rootOffsetEnd = userDataUsage->pushConstOffsets.size(); rootOffset < rootOffsetEnd;
+         ++rootOffset) {
+      for (unsigned dwordOffset = 0, dwordEndOffset = userDataUsage->pushConstOffsets[rootOffset].size();
+           dwordOffset != dwordEndOffset; ++dwordOffset) {
+        UserDataNodeUsage &pushConstOffset = userDataUsage->pushConstOffsets[rootOffset][dwordOffset];
+        if (pushConstOffset.users.empty())
+          continue;
 
-      // Check that the load size does not overlap with the next used offset in the push constant.
-      bool haveOverlap = false;
-      unsigned endOffset =
-          std::min(dwordOffset + pushConstOffset.dwordSize, unsigned(userDataUsage->pushConstOffsets.size()));
-      for (unsigned followingOffset = dwordOffset + 1; followingOffset != endOffset; ++followingOffset) {
-        if (!userDataUsage->pushConstOffsets[followingOffset].users.empty()) {
-          haveOverlap = true;
-          break;
+        // Check that the load size does not overlap with the next used offset in the push constant.
+        bool haveOverlap = false;
+        unsigned endOffset = std::min(dwordOffset + pushConstOffset.dwordSize, dwordEndOffset);
+        for (unsigned followingOffset = dwordOffset + 1; followingOffset != endOffset; ++followingOffset) {
+          if (!userDataUsage->pushConstOffsets[rootOffset][followingOffset].users.empty()) {
+            haveOverlap = true;
+            break;
+          }
         }
-      }
-      if (haveOverlap) {
-        userDataUsage->pushConstSpill = true;
-        continue;
-      }
+        if (haveOverlap) {
+          userDataUsage->pushConstSpill = true;
+          continue;
+        }
 
-      // Add the arg (part of the push const) that we can potentially unspill.
-      assert(dwordOffset + pushConstOffset.dwordSize - 1 <=
-             static_cast<unsigned>(UserDataMapping::PushConstMax) - static_cast<unsigned>(UserDataMapping::PushConst0));
-      addUserDataArg(userDataArgs, static_cast<unsigned>(UserDataMapping::PushConst0) + dwordOffset,
-                     pushConstOffset.dwordSize, "pushConst" + Twine(dwordOffset), &pushConstOffset.entryArgIdx,
-                     builder);
+        // Add the arg (part of the push const) that we can potentially unspill.
+        assert(dwordOffset + pushConstOffset.dwordSize - 1 <= static_cast<unsigned>(UserDataMapping::PushConstMax) -
+                                                                  static_cast<unsigned>(UserDataMapping::PushConst0));
+        addUserDataArg(userDataArgs, static_cast<unsigned>(UserDataMapping::PushConst0) + dwordOffset,
+                       pushConstOffset.dwordSize, "pushConst" + Twine(dwordOffset), &pushConstOffset.entryArgIdx,
+                       builder);
+      }
     }
 
     return;
@@ -1293,23 +1342,26 @@ void PatchEntryPointMutate::addUserDataArgs(SmallVectorImpl<UserDataArg> &userDa
         //    Each statically used member of a push constant block must be placed at an Offset such that the entire
         //    member is entirely contained within the VkPushConstantRange for each OpEntryPoint that uses it, and
         //    the stageFlags for that range must specify the appropriate VkShaderStageFlagBits for that stage.
-        unsigned dwordEndOffset = userDataUsage->pushConstOffsets.size();
+        if (node.offsetInDwords >= userDataUsage->pushConstOffsets.size()) {
+          break;
+        }
+
+        unsigned dwordEndOffset = userDataUsage->pushConstOffsets[node.offsetInDwords].size();
         if (dwordEndOffset > node.sizeInDwords) {
           userDataUsage->pushConstSpill = true;
           dwordEndOffset = node.sizeInDwords;
         }
-
         for (unsigned dwordOffset = 0; dwordOffset != dwordEndOffset; ++dwordOffset) {
-          UserDataNodeUsage &pushConstOffset = userDataUsage->pushConstOffsets[dwordOffset];
+          UserDataNodeUsage &pushConstOffset = userDataUsage->pushConstOffsets[node.offsetInDwords][dwordOffset];
           if (pushConstOffset.users.empty())
             continue;
 
           // Check that the load size does not overlap with the next used offset in the push constant.
           bool haveOverlap = false;
-          unsigned endOffset =
-              std::min(dwordOffset + pushConstOffset.dwordSize, unsigned(userDataUsage->pushConstOffsets.size()));
+          unsigned endOffset = std::min(dwordOffset + pushConstOffset.dwordSize,
+                                        unsigned(userDataUsage->pushConstOffsets[node.offsetInDwords].size()));
           for (unsigned followingOffset = dwordOffset + 1; followingOffset != endOffset; ++followingOffset) {
-            if (!userDataUsage->pushConstOffsets[followingOffset].users.empty()) {
+            if (!userDataUsage->pushConstOffsets[node.offsetInDwords][followingOffset].users.empty()) {
               haveOverlap = true;
               break;
             }

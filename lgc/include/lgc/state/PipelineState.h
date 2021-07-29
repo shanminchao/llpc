@@ -236,6 +236,9 @@ public:
   // Find the push constant resource node
   const ResourceNode *findPushConstantResourceNode() const;
 
+  // Find the push constant resource node at the gieven set and binding.
+  const ResourceNode *findPushConstantResourceNode(unsigned set, unsigned binding) const;
+
   // Find the resource node for the given set,binding
   std::pair<const ResourceNode *, const ResourceNode *> findResourceNode(ResourceNodeType nodeType, unsigned descSet,
                                                                          unsigned binding) const;

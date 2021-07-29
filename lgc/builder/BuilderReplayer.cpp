@@ -415,7 +415,8 @@ Value *BuilderReplayer::processCall(unsigned opcode, CallInst *call) {
                                            args[2],                                    // pDescIndex
                                            cast<ConstantInt>(args[3])->getZExtValue(), // flags
                                            isa<PointerType>(call->getType()) ? call->getType()->getPointerElementType()
-                                                                             : nullptr); // pPointeeTy
+                                                                             : nullptr, // pPointeeTy
+                                           "", call);
   }
 
   case BuilderRecorder::Opcode::GetDescStride:

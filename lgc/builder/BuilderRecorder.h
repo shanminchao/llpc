@@ -348,7 +348,8 @@ public:
   // Descriptor operations
 
   llvm::Value *CreateLoadBufferDesc(unsigned descSet, unsigned binding, llvm::Value *descIndex, unsigned flags,
-                                    llvm::Type *pointeeTy, const llvm::Twine &instName) override final;
+                                    llvm::Type *pointeeTy, const llvm::Twine &instName,
+                                    llvm::CallInst *) override final;
 
   llvm::Value *CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
                                    const llvm::Twine &instName) override final;

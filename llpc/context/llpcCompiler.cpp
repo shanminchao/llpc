@@ -1044,8 +1044,14 @@ static bool hasUnrelocatableDescriptorNode(const ResourceMappingData *resourceMa
 
   // If there is no 1-to-1 mapping between descriptor sets and descriptor tables, then relocatable shaders will fail.
   SmallSet<unsigned, 8> descriptorSetsSeen;
+  bool sawAPushConstant = false;
   for (unsigned i = 0; i < resourceMapping->userDataNodeCount; ++i) {
     const ResourceMappingNode *node = &resourceMapping->pUserDataNodes[i].node;
+    if (node->type == ResourceMappingNodeType ::PushConst) {
+      if (sawAPushConstant)
+        return true;
+      sawAPushConstant = true;
+    }
     if (node->type != ResourceMappingNodeType::DescriptorTableVaPtr)
       continue;
     const ResourceMappingNode *innerNode = node->tablePtr.pNext;
